@@ -1,0 +1,127 @@
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL 16 Database
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: antigraffiti_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-antigraffiti_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-antigraffiti_password}
+      POSTGRES_DB: ${POSTGRES_DB:-antigraffiti_db}
+      TZ: UTC
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-antigraffiti_user} -d ${POSTGRES_DB:-antigraffiti_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - antigraffiti_internal
+
+  # ----------------------------------------------------------------------------
+  # Redis - Cache & Task Queue
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: antigraffiti_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - antigraffiti_internal
+
+  # ----------------------------------------------------------------------------
+  # FastAPI Web Application & Telegram Webhook
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: antigraffiti_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - storage_data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - antigraffiti_internal
+      - antigraffiti_public
+
+  # ----------------------------------------------------------------------------
+  # Background Worker (AI Analysis & Notifications Queue)
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: antigraffiti_worker
+    restart: unless-stopped
+    command: ["python", "-m", "arq", "app.workers.worker.WorkerSettings"]
+    env_file:
+      - .env
+    volumes:
+      - storage_data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - antigraffiti_internal
+
+  # ----------------------------------------------------------------------------
+  # Nginx Reverse Proxy (SSL Termination & Rate Limiting)
+  # ----------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: antigraffiti_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+      - storage_data:/app/storage:ro
+    depends_on:
+      - api
+    networks:
+      - antigraffiti_public
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  storage_data:
+    driver: local
+
+networks:
+  antigraffiti_internal:
+    driver: bridge
+    internal: true
+  antigraffiti_public:
+    driver: bridge
